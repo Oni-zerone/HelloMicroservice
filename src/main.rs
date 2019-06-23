@@ -1,28 +1,54 @@
-extern crate hyper;
-extern crate futures;
+#![feature(proc_macro_hygiene)]
+#![feature(rustc_private)]
 
-#![feature(proc_macro)]
+extern crate env_logger;
+extern crate futures;
+extern crate hyper;
 extern crate maud;
+extern crate url;
+
+#[macro_use]
+extern crate serde_json;
+
+#[macro_use]
+extern crate serde_derive;
 
 #[macro_use]
 extern crate log;
-#[macro_use]
-extern crate serde_derive;
+
 #[macro_use]
 extern crate  diesel;
-extern crate env_logger;
+
+use std::collections::HashMap;
+use std::error::Error;
+use std::env;
+use std::io;
 
 use hyper::{Chunk, StatusCode};
 use hyper::Method::{Get, Post};
 use hyper::server::{Request, Response, Service};
+use hyper::header::{ContentLength, ContentType};
 
 use futures::Stream;
 use futures::future::{Future, FutureResult};
 
+use diesel::prelude::*;
+use diesel::pg::PgConnection;
+
+use maud::html;
+
 mod schema;
 mod models;
 
+use models::{Message, NewMessage};
+use schema::messages;
+
 struct Microservice;
+
+struct TimeRange {
+    before: Option<i64>,
+    after: Option<i64>,
+}
 
 impl Service for Microservice {
     type Request = Request;
@@ -71,22 +97,11 @@ impl Service for Microservice {
     }
 }
 
-struct TimeRange {
-    before: Option<i64>,
-    after: Option<i64>,
-}
+const DEFAULT_DATABASE_URL: &'static str = "postgresql://postgresql@localhost:5432";
 
-struct NewMessage {
-    username: String,
-    message: String,
-}
-
-use std::env;
-const DEFAULT_DATABASE_URL: &'static str = "postgresql://Oni_01@localhost:5432";
-
-fn connect_to_db() -> Option<PGConnection> {
+fn connect_to_db() -> Option<PgConnection> {
     let database_url = env::var("DATABASE_URL").unwrap_or(String::from(DEFAULT_DATABASE_URL));
-    match PGConnection::establish(&database_url) {
+    match PgConnection::establish(&database_url) {
         Ok(connection) => Some(connection),
         Err(error) => {
             error!("Error connecting to database: {}", error.description());
@@ -107,14 +122,16 @@ fn parse_query(query: &str) -> Result<TimeRange, String> {
         }
     }
 
+    let after = args.get("after").map(|value| value.parse::<i64>());
+    if let Some(Err(ref error)) = after {
+        return Err(format!("Error parsing a 'after' {}", error));
+    }
+
     Ok(TimeRange {
         before: before.map(|b| b.unwrap()),
         after: after.map(|a| a.unwrap()),
     })
 }
-
-use std::collections::HashMap;
-use std::io;
 
 fn parse_from(from_chunk: Chunk) -> FutureResult<NewMessage, hyper::Error> {
     let mut form = url::form_urlencoded::parse(from_chunk.as_ref())
@@ -136,10 +153,9 @@ fn parse_from(from_chunk: Chunk) -> FutureResult<NewMessage, hyper::Error> {
 }
 
 fn write_to_db(new_message: NewMessage,
-               db_connection: &PGConnection) -> FutureResult<i64, hyper::Error> {
-    use schema::messages;
+               db_connection: &PgConnection) -> FutureResult<i64, hyper::Error> {
 
-    let timestamp = diesel::insert_into(message::table)
+    let timestamp = diesel::insert_into(messages::table)
         .values(&new_message)
         .returning(messages::timestamp)
         .get_result(db_connection);
@@ -149,37 +165,26 @@ fn write_to_db(new_message: NewMessage,
         Err(error) => {
             error!("Error writing to database: {}", error.description());
             futures::future::err(hyper::Error::from(
-                io::Error::new(io::ErrorKind::Other, "servicce error"),
+                io::Error::new(io::ErrorKind::Other, "service error"),
             ))
         }
-
     }
-    
-    futures::future::ok(0)
 }
 
-fn query_db(time_range: TimeRange, db_connection: &PGConnection) -> Option<Vec<Message>> {
-    use schema::messages;
+fn query_db(time_range: TimeRange, db_connection: &PgConnection) -> Option<Vec<Message>> {
     let TimeRange { before, after } = time_range;
-    let query_result = match (before, after) {
-        (Some(before), Some(after)) => {
-            messages::table
-                .filter(messages::timestamp.lt(before as i64))
-                .filter(messages::timestamp.gt(after as i64))
-                .load::<Message>(db_connection)
-        }
-        (Some(before), _) => {
-            messages::table
-                .filter(messages::timestamp.lt(before as i64))
-                .load::<Message>(db_connection)
-        }
-        (_, Some(after)) => {
-            messages::table
-                .filter(messages::timestamp.gt(after as i64))
-                .load::<Message>(db_connection)
-        }
-        _ => messages::table.load::<Message>(db_connection)
-    };
+
+    let mut query = messages::table.into_boxed();
+
+    if let Some(before) = before {
+        query = query.filter(messages::timestamp.lt(before as i64))
+    }
+
+    if let Some(after) = after {
+        query = query.filter(messages::timestamp.gt(after as i64))
+    }
+
+    let query_result = query.load::<Message>(db_connection);
     match query_result {
         Ok(result) => Some(result),
         Err(error) => {
@@ -203,9 +208,6 @@ fn make_get_response(messages: Option<Vec<Message>>) -> FutureResult<hyper::Resp
     futures::future::ok(response)
 }
 
-#[macro_use]
-extern crate serde_json;
-
 fn make_post_response(result: Result<i64, hyper::Error>) -> FutureResult<hyper::Response, hyper::Error> {
     match result {
         Ok(timestamp) => {
@@ -225,7 +227,7 @@ fn make_error_response(error_message: &str) -> FutureResult<hyper::Response, hyp
     let payload = json!({"error": error_message}).to_string();
     let response = Response::new()
         .with_status(StatusCode::InternalServerError)
-        .with_header(ContentLength::payload.len() as u64)
+        .with_header(ContentLength(payload.len() as u64))
         .with_header(ContentType::json())
         .with_body(payload);
     debug!("{:?}", response);
@@ -235,8 +237,8 @@ fn make_error_response(error_message: &str) -> FutureResult<hyper::Response, hyp
 fn render_page(messages: Vec<Message>) -> String {
     (html! {
         head {
-            title "Hello Microservice!"
-            style "body { font-family: monospace }"
+            title {"Hello Microservice!"} 
+            style { "body { font-family: monospace }" }
         }
         body {
             ul {
@@ -247,7 +249,7 @@ fn render_page(messages: Vec<Message>) -> String {
                 }
             }
         }
-    }).to_string()
+    }).into_string()
 }
 
 fn main() {
