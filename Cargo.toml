@@ -1,5 +1,5 @@
 [package]
-name = "HelloMicroservice"
+name = "hello_microservice"
 version = "0.1.0"
 authors = ["Andrea Altea <oni.zerone@gmail.com>"]
 edition = "2018"
